@@ -13,7 +13,6 @@ from threading import Thread, Lock
 from realtimerendering.realtimeconsts import CLIENT_IP_ADDRESS, CLIENT_PORT, SERVER_PORT, SERVER_IP_ADDRESS, OUTSIZE, \
     ALL_MODEL_FILES_LIST
 
-
 mutex = Lock()
 receiveLatentDirty = False
 receiveLatent = []
@@ -28,8 +27,10 @@ with open(ALL_MODEL_FILES_LIST[-1], 'rb') as f:
 
 model.eval()
 
-
+NORMALIZE_OUTPUT_IMAGE = False
 LAYER_SELECT = None
+CHANNEL_SELECT = 0
+NUMBER_CHANNELS_IN_OUTPUT = 3
 
 LATENT_X_COORD = 0.0
 LATENT_Y_COORD = 0.0
@@ -79,7 +80,7 @@ def degrade_layer_by_name(t_model, layer_name: str, threshold: float = 0.1):
     sd = t_model.state_dict()
     t_values = sd[layer_name]
     s = t_values.shape
-    print(t_values.shape)
+    print(s)
 
     degrade_picks = np.random.rand(s[0], s[1], s[2], s[3])
     degrade_picks = torch.tensor((degrade_picks >= threshold).astype(float)).cuda()
@@ -88,9 +89,16 @@ def degrade_layer_by_name(t_model, layer_name: str, threshold: float = 0.1):
     t_model.load_state_dict(sd)
 
 
+def degrade_layer_by_idx(addr, *args):
+    global model
+    ln = get_layer_names(model)
+    print(ln[args[0]])
+    degrade_layer_by_name(model, ln[args[0]], threshold = float(args[1]))
+
+
 def recv_degrade_layer_by_name(addr, *args):
     global model, receiveLatentDirty
-    degrade_layer_by_name(model, args[0], threshold = float(args[1]))
+    degrade_layer_by_name(model, args[0], threshold=float(args[1]))
     receiveLatentDirty = True
 
 
@@ -98,7 +106,11 @@ def get_number_of_available_models(addr, *args):
     oscSender.send_message('/number_models', len(ALL_MODEL_FILES_LIST))
 
 
-def get_available_models_by_name(addr, *args):
+def get_available_model_names(addr, *args):
+    oscSender.send_message('/available_model_names', ALL_MODEL_FILES_LIST)
+
+
+def get_model_idx_by_name(addr, *args):
     tcount = 0
     out_models = []
     for x in ALL_MODEL_FILES_LIST:
@@ -162,22 +174,58 @@ def set_latent_coords(addr, *args):
     receiveLatentDirty = True
 
 
+def get_number_channels(addr, *args):
+    global NUMBER_CHANNELS_IN_OUTPUT
+    oscSender.send_message('/number_channels_in_output', [NUMBER_CHANNELS_IN_OUTPUT])
+
+
+def set_channel_select(addr, *args):
+    global CHANNEL_SELECT, receiveLatentDirty
+    CHANNEL_SELECT = int(args[0])
+
+    if CHANNEL_SELECT < 0:
+        CHANNEL_SELECT = 0
+    elif CHANNEL_SELECT > (NUMBER_CHANNELS_IN_OUTPUT - 3):
+        CHANNEL_SELECT = NUMBER_CHANNELS_IN_OUTPUT - 3
+
+    oscSender.send_message('/current_channel', [CHANNEL_SELECT])
+    receiveLatentDirty = True
+
+
+def set_normalize_output_image(addr, *args):
+    global NORMALIZE_OUTPUT_IMAGE, receiveLatentDirty
+    NORMALIZE_OUTPUT_IMAGE = bool(args[0])
+    receiveLatentDirty = True
+
+
 dispatcher = dispatcher.Dispatcher()
-dispatcher.map('/get_number_models', get_number_of_available_models)
-dispatcher.map('/latent', receive_latent_vector)
-dispatcher.map('/load_model_by_index', load_model_by_index)
-dispatcher.map('/get_available_layer_names', get_available_layers)
-dispatcher.map('/degrade_layer_by_name', recv_degrade_layer_by_name)
-dispatcher.map('/revert_state_dict', revert_state_dict)
-dispatcher.map('/get_render_layers', get_render_layers)
-dispatcher.map('/set_render_layer', set_render_layer)
-dispatcher.map('/set_latent_coords', set_latent_coords)
+dispatcher.map('/get_number_models', get_number_of_available_models)  # no args
+dispatcher.map('/load_model_by_index', load_model_by_index)  # [int]
+dispatcher.map('/get_available_model_names', get_available_model_names)  # no args
+dispatcher.map('/get_model_idx_by_name', get_model_idx_by_name)  # [str]
+dispatcher.map('/load_model_by_name', load_model_by_name)  # [str]
+
+dispatcher.map('/latent', receive_latent_vector) # [float*512]
+
+dispatcher.map('/get_available_degrade_layer_names', get_available_layers)  # no args
+dispatcher.map('/degrade_layer_by_name', recv_degrade_layer_by_name)  # [str]
+dispatcher.map('/degrade_layer_by_idx', degrade_layer_by_idx)
+
+dispatcher.map('/revert_state_dict', revert_state_dict)  # no args
+
+dispatcher.map('/get_render_layers', get_render_layers)  # no args
+dispatcher.map('/set_render_layer', set_render_layer)  # [int]
+
+dispatcher.map('/set_latent_coords', set_latent_coords)  # [float, float]
+
+dispatcher.map('/get_number_channels', get_number_channels)  # no args
+dispatcher.map('/set_channel_select', set_channel_select)  # [int]
+dispatcher.map('/set_normalize_output_image', set_normalize_output_image)  # [bool]
 
 oscListener = osc_server.ThreadingOSCUDPServer((SERVER_IP_ADDRESS, SERVER_PORT), dispatcher)
 oscListenerThread = Thread(target=oscListener.serve_forever, args=())
 print("Starting OSC listener thread.")
 oscListenerThread.start()
-
 
 receiveLatent = np.random.rand(1, 512)
 receiveLatentDirty = True
@@ -215,7 +263,7 @@ def get_ws_from_xy_coords(model, w0_seeds):
 
 
 def get_image_from_numpy_array(latent_vector: np.array):
-    global LAYER_SELECT, LATENT_X_COORD, LATENT_Y_COORD, model
+    global LAYER_SELECT, LATENT_X_COORD, LATENT_Y_COORD, model, NORMALIZE_OUTPUT_IMAGE, CHANNEL_SELECT, NUMBER_CHANNELS_IN_OUTPUT
     ws = get_ws_from_xy_coords(model, get_seed(LATENT_X_COORD, LATENT_Y_COORD))
 
     if LAYER_SELECT is None:
@@ -232,8 +280,16 @@ def get_image_from_numpy_array(latent_vector: np.array):
 
     out_img = (out_img.permute(0, 2, 3, 1) * 0.5 + 0.5019607843137255).clamp(0.0, 1.0)
 
+    if NUMBER_CHANNELS_IN_OUTPUT != out_img.shape[3]:
+        NUMBER_CHANNELS_IN_OUTPUT = out_img.shape[3]
+        oscSender.send_message('/number_channels_in_output', [NUMBER_CHANNELS_IN_OUTPUT])
+
     if out_img.shape[3] > 3:
-        out_img = out_img[:,:,:,:3]
+        out_img = out_img[:, :, :, CHANNEL_SELECT:CHANNEL_SELECT + 3]
+
+    if NORMALIZE_OUTPUT_IMAGE:
+        img_range = out_img.max() - out_img.min()
+        out_img = (out_img - out_img.min()) / img_range
 
     out_img = out_img[0].detach().cpu().numpy()
     return out_img
