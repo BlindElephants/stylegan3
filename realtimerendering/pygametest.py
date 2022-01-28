@@ -15,10 +15,14 @@ from realtimerendering.realtimeconsts import CLIENT_IP_ADDRESS, CLIENT_PORT, SER
 
 mutex = Lock()
 receiveLatentDirty = False
+receivedXyCoords = False
+
+
+last_ws = None
+receiveLatentBuffer = []
 receiveLatent = []
 
 oscSender = udp_client.SimpleUDPClient(CLIENT_IP_ADDRESS, CLIENT_PORT)
-
 ORIGINAL_MODEL_STATE_DICT = None
 
 with open(ALL_MODEL_FILES_LIST[-1], 'rb') as f:
@@ -34,6 +38,8 @@ NUMBER_CHANNELS_IN_OUTPUT = 3
 
 LATENT_X_COORD = 0.0
 LATENT_Y_COORD = 0.0
+
+
 
 
 def get_render_layers(addr, *args):
@@ -157,21 +163,29 @@ def load_model_by_index(addr, *args):
 
 
 def receive_latent_vector(addr, *args):
-    global receiveLatentDirty, receiveLatent
+    global receiveLatentDirty, receiveLatent, receivedXyCoords, receiveLatentBuffer
     if len(args) != 512:
         print('Invalid latent vector size received: {}'.format(len(args)))
         return
+    receivedXyCoords = False
+    receiveLatentBuffer.clear()
 
     with mutex:
         receiveLatent = np.array(args).reshape(1, 512)
         receiveLatentDirty = True
 
 
+def go_to_latent_vector_over_frames(addr, *args):
+    global receiveLatentDirty, receiveLatentBuffer
+
+
 def set_latent_coords(addr, *args):
-    global LATENT_X_COORD, LATENT_Y_COORD, receiveLatentDirty
+    global LATENT_X_COORD, LATENT_Y_COORD, receiveLatentDirty, receivedXyCoords, receiveLatentBuffer
     LATENT_X_COORD = float(args[0])
     LATENT_Y_COORD = float(args[1])
     receiveLatentDirty = True
+    receivedXyCoords = True
+    receiveLatentBuffer.clear()
 
 
 def get_number_channels(addr, *args):
@@ -231,6 +245,21 @@ receiveLatent = np.random.rand(1, 512)
 receiveLatentDirty = True
 
 
+def get_1d_seed_new(x: float):
+    w0_seeds = []
+    seed_1 = np.floor(x)
+    seed_2 = np.ceil(x)
+
+    w_1 = x - seed_1
+    w_2 = 1 - w_1
+
+    if w_1 > 0:
+        w0_seeds.append([int(seed_1), w_1])
+    if w_2 > 0:
+        w0_seeds.append([int(seed_2), w_2])
+    return w0_seeds
+
+
 def get_seed(x, y):
     w0_seeds = []
     for ofs_x, ofs_y in [[0, 0], [1, 0], [0, 1], [1, 1]]:
@@ -264,19 +293,37 @@ def get_ws_from_xy_coords(model, w0_seeds):
 
 def get_image_from_numpy_array(latent_vector: np.array):
     global LAYER_SELECT, LATENT_X_COORD, LATENT_Y_COORD, model, NORMALIZE_OUTPUT_IMAGE, CHANNEL_SELECT, NUMBER_CHANNELS_IN_OUTPUT
-    ws = get_ws_from_xy_coords(model, get_seed(LATENT_X_COORD, LATENT_Y_COORD))
+    global receivedXyCoords, receiveLatent
 
-    if LAYER_SELECT is None:
-        out_img = model.synthesis(ws)
+    if receivedXyCoords:
+        seeds = get_seed(LATENT_X_COORD, LATENT_Y_COORD)
+        ws = get_ws_from_xy_coords(model, seeds)
+        if LAYER_SELECT is None:
+            out_img = model.synthesis(ws)
+        else:
+            ws = ws.to(torch.float32).unbind(dim=1)
+            x = model.synthesis.input(ws[0])
+
+            for layer_name, w in zip(model.synthesis.layer_names, ws[1:]):
+                x = getattr(model.synthesis, layer_name)(x, w)
+                if LAYER_SELECT in layer_name:
+                    break
+            out_img = x.to(torch.float32)
     else:
-        ws = ws.to(torch.float32).unbind(dim=1)
-        x = model.synthesis.input(ws[0])
+        receiveLatent = torch.tensor(receiveLatent).to('cuda')
+        if LAYER_SELECT is None:
+            out_img = model(receiveLatent, c=None)
+        else:
+            ws = model.mapping(receiveLatent, c=None)
+            ws = ws.to(torch.float32).unbind(dim=1)
+            x = model.synthesis.input(ws[0])
 
-        for layer_name, w in zip(model.synthesis.layer_names, ws[1:]):
-            x = getattr(model.synthesis, layer_name)(x, w)
-            if LAYER_SELECT in layer_name:
-                break
-        out_img = x.to(torch.float32)
+            for layer_name, w in zip(model.synthesis.layer_names, ws[1:]):
+                x = getattr(model.synthesis, layer_name)(x, w)
+                if LAYER_SELECT in layer_name:
+                    break
+            out_img = x.to(torch.float32)
+
 
     out_img = (out_img.permute(0, 2, 3, 1) * 0.5 + 0.5019607843137255).clamp(0.0, 1.0)
 
@@ -294,68 +341,69 @@ def get_image_from_numpy_array(latent_vector: np.array):
     out_img = out_img[0].detach().cpu().numpy()
     return out_img
 
+if __name__ == "__main__":
 
-img = None
+    img = None
 
-pygame.init()
-pygame.display.set_caption('ha-realtime-output')
-pygame.display.set_mode(OUTSIZE, DOUBLEBUF | OPENGL | pygame.NOFRAME)
-pygame.display.gl_set_attribute(pygame.GL_ALPHA_SIZE, 8)
+    pygame.init()
+    pygame.display.set_caption('ha-realtime-output')
+    pygame.display.set_mode(OUTSIZE, DOUBLEBUF | OPENGL | pygame.NOFRAME)
+    pygame.display.gl_set_attribute(pygame.GL_ALPHA_SIZE, 8)
 
-glMatrixMode(GL_PROJECTION)
-glOrtho(0, OUTSIZE[0], OUTSIZE[1], 0, 1, -1)
-glMatrixMode(GL_MODELVIEW)
-glLoadIdentity()
-glDisable(GL_DEPTH_TEST)
-glClearColor(1.0, 1.0, 1.0, 1.0)
-glEnable(GL_TEXTURE_2D)
-
-senderTexture = glGenTextures(1)
-glBindTexture(GL_TEXTURE_2D, senderTexture)
-glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
-glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
-glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
-glBindTexture(GL_TEXTURE_2D, 0)
-
-
-def update():
-    global receiveLatentDirty, receiveLatent, img
-
-    if receiveLatentDirty:
-        img = get_image_from_numpy_array(receiveLatent)
-        receiveLatentDirty = False
-
-    glBindTexture(GL_TEXTURE_2D, senderTexture)
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.shape[0], img.shape[1], 0, GL_RGB, GL_FLOAT, img)
-
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+    glMatrixMode(GL_PROJECTION)
+    glOrtho(0, OUTSIZE[0], OUTSIZE[1], 0, 1, -1)
+    glMatrixMode(GL_MODELVIEW)
     glLoadIdentity()
-    glBegin(GL_QUADS)
-    glTexCoord(0, 0)
-    glVertex2f(0, 0)
+    glDisable(GL_DEPTH_TEST)
+    glClearColor(1.0, 1.0, 1.0, 1.0)
+    glEnable(GL_TEXTURE_2D)
 
-    glTexCoord(1, 0)
-    glVertex2f(OUTSIZE[0], 0)
-
-    glTexCoord(1, 1)
-    glVertex2f(OUTSIZE[0], OUTSIZE[1])
-
-    glTexCoord(0, 1)
-    glVertex2f(0, OUTSIZE[1])
-
-    glEnd()
-    pygame.display.flip()
+    senderTexture = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, senderTexture)
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+    glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
     glBindTexture(GL_TEXTURE_2D, 0)
 
 
-while True:
-    update()
-    for event in pygame.event.get():
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                pygame.quit()
-                oscListener.server_close()
-                oscListener.shutdown()
-                oscListenerThread.join(timeout=2.0)
-                quit()
+    def update():
+        global receiveLatentDirty, receiveLatent, img
+
+        if receiveLatentDirty:
+            img = get_image_from_numpy_array(receiveLatent)
+            receiveLatentDirty = False
+
+        glBindTexture(GL_TEXTURE_2D, senderTexture)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.shape[0], img.shape[1], 0, GL_RGB, GL_FLOAT, img)
+
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+        glLoadIdentity()
+        glBegin(GL_QUADS)
+        glTexCoord(0, 0)
+        glVertex2f(0, 0)
+
+        glTexCoord(1, 0)
+        glVertex2f(OUTSIZE[0], 0)
+
+        glTexCoord(1, 1)
+        glVertex2f(OUTSIZE[0], OUTSIZE[1])
+
+        glTexCoord(0, 1)
+        glVertex2f(0, OUTSIZE[1])
+
+        glEnd()
+        pygame.display.flip()
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+
+    while True:
+        update()
+        for event in pygame.event.get():
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    pygame.quit()
+                    oscListener.server_close()
+                    oscListener.shutdown()
+                    oscListenerThread.join(timeout=2.0)
+                    quit()
