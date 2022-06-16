@@ -9,18 +9,18 @@ from copy import deepcopy
 
 from pythonosc import dispatcher, osc_server, udp_client
 from threading import Thread, Lock
+from typing import List
 
 from realtimerendering.realtimeconsts import CLIENT_IP_ADDRESS, CLIENT_PORT, SERVER_PORT, SERVER_IP_ADDRESS, OUTSIZE, \
-    ALL_MODEL_FILES_LIST
+    ALL_MODEL_FILES_LIST, OUT_PERF_RECORDER_FILE
+
+import datetime
 
 mutex = Lock()
-receiveLatentDirty = False
-receivedXyCoords = False
 
-
+last_img = None
 last_ws = None
 receiveLatentBuffer = []
-receiveLatent = []
 
 oscSender = udp_client.SimpleUDPClient(CLIENT_IP_ADDRESS, CLIENT_PORT)
 ORIGINAL_MODEL_STATE_DICT = None
@@ -29,8 +29,11 @@ with open(ALL_MODEL_FILES_LIST[-1], 'rb') as f:
     model = pickle.load(f)['G_ema'].cuda()
     ORIGINAL_MODEL_STATE_DICT = deepcopy(model.state_dict())
 
+
+
 model.eval()
 
+LAST_LOADED_MODEL = ALL_MODEL_FILES_LIST[-1]
 NORMALIZE_OUTPUT_IMAGE = False
 LAYER_SELECT = None
 CHANNEL_SELECT = 0
@@ -40,27 +43,27 @@ LATENT_X_COORD = 0.0
 LATENT_Y_COORD = 0.0
 
 
-
-
 def get_render_layers(addr, *args):
     global model, oscSender
     oscSender.send_message('/render_layers', model.synthesis.layer_names)
 
 
 def set_render_layer(addr, *args):
-    global model, LAYER_SELECT, receiveLatentDirty
+    global model, LAYER_SELECT, receiveLatentBuffer, last_ws
     ln = model.synthesis.layer_names
+
+    if args[0] >= len(ln):
+        print("Error, invalid index received: out of range.")
+        return
 
     if args[0] < 0:
         LAYER_SELECT = None
-        receiveLatentDirty = True
-    elif args[0] >= len(ln):
-        print("Error, invalid index received: out of range.")
-        return
     else:
         LAYER_SELECT = ln[args[0]]
-        receiveLatentDirty = True
         print("Layer Selected for render: {}".format(LAYER_SELECT))
+
+    if len(receiveLatentBuffer) == 0:
+        receiveLatentBuffer.append(last_ws)
 
 
 def revert_state_dict(addr, *args):
@@ -83,6 +86,7 @@ def get_available_layers(addr, *args):
 
 
 def degrade_layer_by_name(t_model, layer_name: str, threshold: float = 0.1):
+    global receiveLatentBuffer, last_ws
     sd = t_model.state_dict()
     t_values = sd[layer_name]
     s = t_values.shape
@@ -94,18 +98,20 @@ def degrade_layer_by_name(t_model, layer_name: str, threshold: float = 0.1):
     sd[layer_name] = t_values
     t_model.load_state_dict(sd)
 
+    if len(receiveLatentBuffer) == 0:
+        receiveLatentBuffer.append(last_ws)
+
 
 def degrade_layer_by_idx(addr, *args):
     global model
     ln = get_layer_names(model)
     print(ln[args[0]])
-    degrade_layer_by_name(model, ln[args[0]], threshold = float(args[1]))
+    degrade_layer_by_name(model, ln[args[0]], threshold=float(args[1]))
 
 
 def recv_degrade_layer_by_name(addr, *args):
-    global model, receiveLatentDirty
+    global model
     degrade_layer_by_name(model, args[0], threshold=float(args[1]))
-    receiveLatentDirty = True
 
 
 def get_number_of_available_models(addr, *args):
@@ -113,7 +119,16 @@ def get_number_of_available_models(addr, *args):
 
 
 def get_available_model_names(addr, *args):
-    oscSender.send_message('/available_model_names', ALL_MODEL_FILES_LIST)
+    oscSender.send_message('/clear_available_model_names', True)
+    MAX_LEN = 200
+    NUM_FULL_BATCHES = len(ALL_MODEL_FILES_LIST) // MAX_LEN
+    REMAINDER = len(ALL_MODEL_FILES_LIST) % MAX_LEN
+
+    for m in range(NUM_FULL_BATCHES):
+        oscSender.send_message('/available_model_names', ALL_MODEL_FILES_LIST[m*MAX_LEN:(m*MAX_LEN) + MAX_LEN])
+
+    if REMAINDER > 0:
+        oscSender.send_message('/available_model_names', ALL_MODEL_FILES_LIST[MAX_LEN*NUM_FULL_BATCHES:])
 
 
 def get_model_idx_by_name(addr, *args):
@@ -128,23 +143,22 @@ def get_model_idx_by_name(addr, *args):
 
 
 def load_model_by_name(addr, *args):
-    global model, receiveLatentDirty, ORIGINAL_MODEL_STATE_DICT
+    global model, ORIGINAL_MODEL_STATE_DICT, LAST_LOADED_MODEL
     for x in ALL_MODEL_FILES_LIST:
         if args[0] in x:
             print("Loading model {}".format(x))
             with open(x, 'rb') as f:
                 model = pickle.load(f)['G_ema'].cuda()
                 ORIGINAL_MODEL_STATE_DICT = deepcopy(model.state_dict())
-
+            LAST_LOADED_MODEL = x
             model.eval()
-            receiveLatentDirty = True
             return
 
     print("No model found by name: {}".format(args[0]))
 
 
 def load_model_by_index(addr, *args):
-    global model, receiveLatentDirty, ORIGINAL_MODEL_STATE_DICT
+    global model, ORIGINAL_MODEL_STATE_DICT, receiveLatentBuffer, last_ws, LAST_LOADED_MODEL
     idx = args[0]
     if not isinstance(idx, int):
         print("Error, should receive an integer value for loadModelByIndex()")
@@ -158,34 +172,64 @@ def load_model_by_index(addr, *args):
         model = pickle.load(f)['G_ema'].cuda()
         ORIGINAL_MODEL_STATE_DICT = deepcopy(model.state_dict())
 
+    LAST_LOADED_MODEL = ALL_MODEL_FILES_LIST[idx]
     model.eval()
-    receiveLatentDirty = True
+
+    if len(receiveLatentBuffer) == 0:
+        receiveLatentBuffer.append(last_ws)
 
 
 def receive_latent_vector(addr, *args):
-    global receiveLatentDirty, receiveLatent, receivedXyCoords, receiveLatentBuffer
-    if len(args) != 512:
+    global receiveLatentBuffer, model
+    if len(args) != 513:
         print('Invalid latent vector size received: {}'.format(len(args)))
         return
-    receivedXyCoords = False
-    receiveLatentBuffer.clear()
 
-    with mutex:
-        receiveLatent = np.array(args).reshape(1, 512)
-        receiveLatentDirty = True
+    if bool(args[0]):
+        receiveLatentBuffer.clear()
+    x = np.array(args[1:]).reshape(1, 512)
+    ws = model.mapping(torch.tensor(x).to('cuda'), c=None)
+    receiveLatentBuffer.append(ws)
 
 
 def go_to_latent_vector_over_frames(addr, *args):
-    global receiveLatentDirty, receiveLatentBuffer
+    #  Args for this should be [clear_buffer: bool, duration_frames: int, latent_vec: float*512]
+    global receiveLatentBuffer, last_ws, LAST_LOADED_MODEL, LAYER_SELECT, CHANNEL_SELECT
+
+    clear_buffer = bool(args[0])
+    duration_frames = int(args[1])
+    latent_vec = args[2:]
+    if len(latent_vec) != 512:
+        print("ERROR")
+        return
+
+    t_last_ws = last_ws
+    if clear_buffer:
+        receiveLatentBuffer.clear()
+    else:
+        if len(receiveLatentBuffer):
+            t_last_ws = receiveLatentBuffer[-1]
+
+    latent_vec = np.array(latent_vec).reshape(1, 512)
+    latent_vec = model.mapping(torch.tensor(latent_vec).to('cuda'), c=None)
+
+    for x in range(duration_frames):
+        receiveLatentBuffer.append(torch.lerp(t_last_ws, latent_vec, 1 / (duration_frames - 1) * x))
+
+    print(f"Added {duration_frames} to receiveLatentBuffer, current size: {len(receiveLatentBuffer)}")
+
+    with open(OUT_PERF_RECORDER_FILE, 'a') as f:
+        out_line = [str(datetime.datetime.now()), LAST_LOADED_MODEL, str(LAYER_SELECT), str(CHANNEL_SELECT)]
+        out_line = out_line + [str(i) for i in args]
+        f.write(', '.join(out_line))
+        f.write('\n')
 
 
 def set_latent_coords(addr, *args):
-    global LATENT_X_COORD, LATENT_Y_COORD, receiveLatentDirty, receivedXyCoords, receiveLatentBuffer
-    LATENT_X_COORD = float(args[0])
-    LATENT_Y_COORD = float(args[1])
-    receiveLatentDirty = True
-    receivedXyCoords = True
+    global receiveLatentBuffer, model
     receiveLatentBuffer.clear()
+    ws = get_ws_from_xy_coords(model, get_seed(float(args[0]), float(args[1])))
+    receiveLatentBuffer.append(ws)
 
 
 def get_number_channels(addr, *args):
@@ -194,7 +238,7 @@ def get_number_channels(addr, *args):
 
 
 def set_channel_select(addr, *args):
-    global CHANNEL_SELECT, receiveLatentDirty
+    global CHANNEL_SELECT, receiveLatentBuffer, last_ws
     CHANNEL_SELECT = int(args[0])
 
     if CHANNEL_SELECT < 0:
@@ -203,13 +247,17 @@ def set_channel_select(addr, *args):
         CHANNEL_SELECT = NUMBER_CHANNELS_IN_OUTPUT - 3
 
     oscSender.send_message('/current_channel', [CHANNEL_SELECT])
-    receiveLatentDirty = True
+
+    if len(receiveLatentBuffer) == 0:
+        receiveLatentBuffer.append(last_ws)
 
 
 def set_normalize_output_image(addr, *args):
-    global NORMALIZE_OUTPUT_IMAGE, receiveLatentDirty
+    global NORMALIZE_OUTPUT_IMAGE, receiveLatentBuffer, last_ws
     NORMALIZE_OUTPUT_IMAGE = bool(args[0])
-    receiveLatentDirty = True
+
+    if len(receiveLatentBuffer) == 0:
+        receiveLatentBuffer.append(last_ws)
 
 
 dispatcher = dispatcher.Dispatcher()
@@ -219,7 +267,7 @@ dispatcher.map('/get_available_model_names', get_available_model_names)  # no ar
 dispatcher.map('/get_model_idx_by_name', get_model_idx_by_name)  # [str]
 dispatcher.map('/load_model_by_name', load_model_by_name)  # [str]
 
-dispatcher.map('/latent', receive_latent_vector) # [float*512]
+dispatcher.map('/latent', receive_latent_vector)  # [float*512]
 
 dispatcher.map('/get_available_degrade_layer_names', get_available_layers)  # no args
 dispatcher.map('/degrade_layer_by_name', recv_degrade_layer_by_name)  # [str]
@@ -236,31 +284,18 @@ dispatcher.map('/get_number_channels', get_number_channels)  # no args
 dispatcher.map('/set_channel_select', set_channel_select)  # [int]
 dispatcher.map('/set_normalize_output_image', set_normalize_output_image)  # [bool]
 
+dispatcher.map('/go_to_latent_vec', go_to_latent_vector_over_frames)
+
 oscListener = osc_server.ThreadingOSCUDPServer((SERVER_IP_ADDRESS, SERVER_PORT), dispatcher)
 oscListenerThread = Thread(target=oscListener.serve_forever, args=())
 print("Starting OSC listener thread.")
 oscListenerThread.start()
 
-receiveLatent = np.random.rand(1, 512)
-receiveLatentDirty = True
+receiveLatentBuffer.clear()
+receiveLatentBuffer.append(model.mapping(torch.tensor(np.random.rand(1, 512)).to('cuda'), c=None))
 
 
-def get_1d_seed_new(x: float):
-    w0_seeds = []
-    seed_1 = np.floor(x)
-    seed_2 = np.ceil(x)
-
-    w_1 = x - seed_1
-    w_2 = 1 - w_1
-
-    if w_1 > 0:
-        w0_seeds.append([int(seed_1), w_1])
-    if w_2 > 0:
-        w0_seeds.append([int(seed_2), w_2])
-    return w0_seeds
-
-
-def get_seed(x, y):
+def get_seed(x: float, y: float) -> List:
     w0_seeds = []
     for ofs_x, ofs_y in [[0, 0], [1, 0], [0, 1], [1, 1]]:
         seed_x = np.floor(x) + ofs_x
@@ -291,40 +326,28 @@ def get_ws_from_xy_coords(model, w0_seeds):
     return w
 
 
-def get_image_from_numpy_array(latent_vector: np.array):
-    global LAYER_SELECT, LATENT_X_COORD, LATENT_Y_COORD, model, NORMALIZE_OUTPUT_IMAGE, CHANNEL_SELECT, NUMBER_CHANNELS_IN_OUTPUT
-    global receivedXyCoords, receiveLatent
+def get_next_frame_from_ws_buffer() -> np.array:
+    global LAYER_SELECT, model, NORMALIZE_OUTPUT_IMAGE, CHANNEL_SELECT, NUMBER_CHANNELS_IN_OUTPUT
+    global receiveLatentBuffer, last_ws
+    ws = receiveLatentBuffer.pop(0)
+    oscSender.send_message('/frames_left_in_buffer', len(receiveLatentBuffer))
 
-    if receivedXyCoords:
-        seeds = get_seed(LATENT_X_COORD, LATENT_Y_COORD)
-        ws = get_ws_from_xy_coords(model, seeds)
-        if LAYER_SELECT is None:
-            out_img = model.synthesis(ws)
-        else:
-            ws = ws.to(torch.float32).unbind(dim=1)
-            x = model.synthesis.input(ws[0])
+    last_ws = deepcopy(ws)
 
-            for layer_name, w in zip(model.synthesis.layer_names, ws[1:]):
-                x = getattr(model.synthesis, layer_name)(x, w)
-                if LAYER_SELECT in layer_name:
-                    break
-            out_img = x.to(torch.float32)
+    if LAYER_SELECT is None:
+        out_img = model.synthesis(ws)
     else:
-        receiveLatent = torch.tensor(receiveLatent).to('cuda')
-        if LAYER_SELECT is None:
-            out_img = model(receiveLatent, c=None)
-        else:
-            ws = model.mapping(receiveLatent, c=None)
-            ws = ws.to(torch.float32).unbind(dim=1)
-            x = model.synthesis.input(ws[0])
+        ws = ws.to(torch.float32).unbind(dim=1)
+        x = model.synthesis.input(ws[0])
 
-            for layer_name, w in zip(model.synthesis.layer_names, ws[1:]):
-                x = getattr(model.synthesis, layer_name)(x, w)
-                if LAYER_SELECT in layer_name:
+        for layer_name, w in zip(model.synthesis.layer_names, ws[1:]):
+            x = getattr(model.synthesis, layer_name)(x, w)
+            try:
+                if LAYER_SELECT and (LAYER_SELECT in layer_name):
                     break
-            out_img = x.to(torch.float32)
-
-
+            except TypeError:
+                pass
+        out_img = x.to(torch.float32)
     out_img = (out_img.permute(0, 2, 3, 1) * 0.5 + 0.5019607843137255).clamp(0.0, 1.0)
 
     if NUMBER_CHANNELS_IN_OUTPUT != out_img.shape[3]:
@@ -341,8 +364,8 @@ def get_image_from_numpy_array(latent_vector: np.array):
     out_img = out_img[0].detach().cpu().numpy()
     return out_img
 
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     img = None
 
     pygame.init()
@@ -368,11 +391,11 @@ if __name__ == "__main__":
 
 
     def update():
-        global receiveLatentDirty, receiveLatent, img
+        global img, last_img
 
-        if receiveLatentDirty:
-            img = get_image_from_numpy_array(receiveLatent)
-            receiveLatentDirty = False
+        if len(receiveLatentBuffer) > 0:
+            img = get_next_frame_from_ws_buffer()
+            last_img = img.copy()
 
         glBindTexture(GL_TEXTURE_2D, senderTexture)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, img.shape[0], img.shape[1], 0, GL_RGB, GL_FLOAT, img)
@@ -382,23 +405,23 @@ if __name__ == "__main__":
         glBegin(GL_QUADS)
         glTexCoord(0, 0)
         glVertex2f(0, 0)
-
         glTexCoord(1, 0)
         glVertex2f(OUTSIZE[0], 0)
-
         glTexCoord(1, 1)
         glVertex2f(OUTSIZE[0], OUTSIZE[1])
-
         glTexCoord(0, 1)
         glVertex2f(0, OUTSIZE[1])
-
         glEnd()
         pygame.display.flip()
         glBindTexture(GL_TEXTURE_2D, 0)
 
 
     while True:
-        update()
+        try:
+            update()
+        except AttributeError:
+            pass
+
         for event in pygame.event.get():
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
